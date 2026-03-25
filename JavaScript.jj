@@ -1,0 +1,887 @@
+/**
+ * Compilador para a linguagem JavaScript (subconjunto)
+ * Analisador Léxico, Sintático e Semântico
+ *
+ * Gerado com JavaCC
+ *
+ * Cobre:
+ *  - Declarações: var, let, const
+ *  - Funções: function, arrow functions básicas
+ *  - Estruturas de controle: if/else, while, for, do-while, switch
+ *  - Expressões: aritméticas, lógicas, relacionais, atribuição
+ *  - Literais: number, string, boolean, null, undefined, array, object
+ *  - Retorno e break/continue
+ *  - Console.log
+ *  - Análise semântica básica: variáveis não declaradas, redeclaração com const
+ */
+
+options {
+    STATIC = false;
+    DEBUG_PARSER = false;
+    DEBUG_LOOKAHEAD = false;
+    DEBUG_TOKEN_MANAGER = false;
+}
+
+PARSER_BEGIN(JavaScript)
+
+import java.util.*;
+import java.io.*;
+
+public class JavaScript {
+
+    // =============================================
+    // ANÁLISE SEMÂNTICA - Tabela de Símbolos
+    // =============================================
+
+    // Pilha de escopos (cada escopo eh um Map nome->tipo)
+    private Deque scopeStack = new ArrayDeque();
+    private List errosSemânticos = new ArrayList();
+    private List avisosSemânticos = new ArrayList();
+    private int erros = 0;
+
+    private static final Set GLOBALS = new HashSet(Arrays.asList(new String[]{
+        "console", "Math", "parseInt", "parseFloat", "isNaN", "isFinite",
+        "String", "Number", "Boolean", "Array", "Object", "JSON",
+        "undefined", "null", "true", "false", "NaN", "Infinity",
+        "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+        "alert", "prompt", "confirm", "document", "window", "process"
+    }));
+
+    /** Entra em um novo escopo */
+    private void enterScope() {
+        scopeStack.push(new LinkedHashMap());
+    }
+
+    /** Sai do escopo atual */
+    private void exitScope() {
+        if (!scopeStack.isEmpty()) {
+            scopeStack.pop();
+        }
+    }
+
+    /** Declara uma variável no escopo atual */
+    private void declareVar(String name, String kind) {
+        if (scopeStack.isEmpty()) return;
+        Map current = (Map) scopeStack.peek();
+        if (current.containsKey(name)) {
+            String prev = (String) current.get(name);
+            if (prev.equals("const") || kind.equals("const")) {
+                erroSemantico("Redeclaração inválida da variável '" + name + "' (declarada como '" + prev + "')");
+            } else {
+                avisoSemantico("Variável '" + name + "' já declarada neste escopo como '" + prev + "'");
+            }
+        }
+        current.put(name, kind);
+    }
+
+    /** Verifica se uma variável está declarada em algum escopo */
+    private boolean isVarDeclared(String name) {
+        for (Object obj : scopeStack) {
+            Map scope = (Map) obj;
+            if (scope.containsKey(name)) return true;
+        }
+        return false;
+    }
+
+    /** Verifica uso de variável e registra erro se não declarada */
+    private void checkVarUse(String name) {
+        if (!GLOBALS.contains(name) && !isVarDeclared(name)) {
+            erroSemantico("Variável '" + name + "' utilizada sem declaração");
+        }
+    }
+
+    private void erroSemantico(String msg) {
+        erros++;
+        errosSemânticos.add("[ERRO SEMÂNTICO] " + msg);
+    }
+
+    private void avisoSemantico(String msg) {
+        avisosSemânticos.add("[AVISO SEMÂNTICO] " + msg);
+    }
+
+    private void imprimirResultados() {
+        System.out.println("\n========================================");
+        System.out.println("     RESULTADO DA ANÁLISE");
+        System.out.println("========================================");
+
+        if (!avisosSemânticos.isEmpty()) {
+            System.out.println("\n--- Avisos ---");
+            for (Object a : avisosSemânticos) System.out.println(a);
+        }
+
+        if (errosSemânticos.isEmpty()) {
+            System.out.println("\n[OK] Análise semântica: nenhum erro encontrado.");
+        } else {
+            System.out.println("\n--- Erros Semânticos ---");
+            for (Object e : errosSemânticos) System.out.println(e);
+        }
+
+        System.out.println("\n--- Resumo ---");
+        System.out.println("Erros semânticos : " + erros);
+        System.out.println("Avisos           : " + avisosSemânticos.size());
+        System.out.println("========================================\n");
+    }
+
+    // =============================================
+    // MAIN
+    // =============================================
+
+    public static void main(String[] args) throws Exception {
+        System.setOut(new PrintStream(System.out, true, "UTF-8"));
+        System.setErr(new PrintStream(System.err, true, "UTF-8"));
+        InputStream input;
+        String filename = "";
+
+        if (args.length > 0) {
+            filename = args[0];
+            input = new FileInputStream(filename);
+            System.out.println("Compilando arquivo: " + filename);
+        } else {
+            System.out.println("Uso: java JavaScript <arquivo.js>");
+            System.out.println("Usando entrada padrão (stdin)...");
+            input = System.in;
+        }
+
+        JavaScript parser = new JavaScript(input);
+        try {
+            parser.enterScope(); // escopo global
+            parser.Program();
+            parser.exitScope();
+            System.out.println("\n[OK] Análise léxica e sintática concluída sem erros.");
+            parser.imprimirResultados();
+        } catch (ParseException e) {
+            System.err.println("\n[ERRO SINTÁTICO] " + e.getMessage());
+            parser.imprimirResultados();
+            System.exit(1);
+        } catch (TokenMgrError e) {
+            System.err.println("\n[ERRO LÉXICO] " + e.getMessage());
+            System.exit(1);
+        }
+    }
+}
+
+PARSER_END(JavaScript)
+
+
+// =============================================
+// ANÁLISE LÉXICA - Tokens
+// =============================================
+
+// Ignorar espaços, tabs e quebras de linha
+SKIP : {
+    " " | "\t" | "\r" | "\n" | "\f"
+}
+
+// Comentários de linha
+SKIP : {
+    <LINE_COMMENT: "//" (~["\n","\r"])* ("\n"|"\r"|"\r\n")?>
+}
+
+// Comentários de bloco
+SKIP : {
+    <BLOCK_COMMENT: "/*" (~["*"] | ("*" ~["/"]))* "*/">
+}
+
+// Palavras reservadas
+TOKEN : {
+    <VAR:        "var">
+  | <LET:        "let">
+  | <CONST:      "const">
+  | <FUNCTION:   "function">
+  | <RETURN:     "return">
+  | <IF:         "if">
+  | <ELSE:       "else">
+  | <WHILE:      "while">
+  | <DO:         "do">
+  | <FOR:        "for">
+  | <BREAK:      "break">
+  | <CONTINUE:   "continue">
+  | <SWITCH:     "switch">
+  | <CASE:       "case">
+  | <JS_DEFAULT: "default">
+  | <NEW:        "new">
+  | <TYPEOF:     "typeof">
+  | <INSTANCEOF: "instanceof">
+  | <IN:         "in">
+  | <OF:         "of">
+  | <CLASS:      "class">
+  | <EXTENDS:    "extends">
+  | <THIS:       "this">
+  | <SUPER:      "super">
+  | <IMPORT:     "import">
+  | <EXPORT:     "export">
+  | <FROM:       "from">
+  | <TRY:        "try">
+  | <CATCH:      "catch">
+  | <FINALLY:    "finally">
+  | <THROW:      "throw">
+  | <DELETE:     "delete">
+  | <VOID:       "void">
+}
+
+// Literais booleanos e especiais
+TOKEN : {
+    <TRUE:      "true">
+  | <FALSE:     "false">
+  | <NULL:      "null">
+  | <UNDEFINED: "undefined">
+}
+
+// Número inteiro e decimal
+TOKEN : {
+    <NUMBER: (["0"-"9"])+ ("." (["0"-"9"])+)? (["e","E"] (["+","-"])? (["0"-"9"])+)?>
+}
+
+// String com aspas simples ou duplas
+TOKEN : {
+    <STRING_DOUBLE: "\"" (~["\"","\\","\n","\r"] | "\\" ~[])* "\"">
+  | <STRING_SINGLE: "'" (~["'","\\","\n","\r"] | "\\" ~[])* "'">
+  | <TEMPLATE_STR:  "`" (~["`","\\","$"] | "\\~[]" | "${" (~["}"])* "}")* "`">
+}
+
+// Identificador
+TOKEN : {
+    <IDENTIFIER: ["a"-"z","A"-"Z","_","$"] (["a"-"z","A"-"Z","0"-"9","_","$"])* >
+}
+
+// Operadores compostos (devem vir antes dos simples)
+TOKEN : {
+    <STRICT_EQ:     "===">
+  | <STRICT_NEQ:    "!==">
+  | <EQ:            "==">
+  | <NEQ:           "!=">
+  | <PLUSPLUS:      "++">
+  | <MINUSMINUS:    "--">
+  | <PLUS_ASSIGN:   "+=">
+  | <MINUS_ASSIGN:  "-=">
+  | <TIMES_ASSIGN:  "*=">
+  | <DIV_ASSIGN:    "/=">
+  | <MOD_ASSIGN:    "%=">
+  | <AND_ASSIGN:    "&&=">
+  | <OR_ASSIGN:     "||=">
+  | <LSHIFT:        "<<">
+  | <RSHIFT:        ">>">
+  | <URSHIFT:       ">>>">
+  | <LEQ:           "<=">
+  | <GEQ:           ">=">
+  | <AND:           "&&">
+  | <OR:            "||">
+  | <NULLCOAL:      "??">
+  | <ARROW:         "=>">
+  | <SPREAD:        "...">
+  | <OPT_CHAIN:     "?.">
+}
+
+// Operadores simples e pontuação
+TOKEN : {
+    <ASSIGN:    "=">
+  | <LT:        "<">
+  | <GT:        ">">
+  | <PLUS:      "+">
+  | <MINUS:     "-">
+  | <TIMES:     "*">
+  | <DIV:       "/">
+  | <MOD:       "%">
+  | <NOT:       "!">
+  | <TILDE:     "~">
+  | <AMP:       "&">
+  | <PIPE:      "|">
+  | <CARET:     "^">
+  | <QUESTION:  "?">
+  | <COLON:     ":">
+  | <SEMICOLON: ";">
+  | <COMMA:     ",">
+  | <DOT:       ".">
+  | <LPAREN:    "(">
+  | <RPAREN:    ")">
+  | <LBRACE:    "{">
+  | <RBRACE:    "}">
+  | <LBRACKET:  "[">
+  | <RBRACKET:  "]">
+}
+
+
+// =============================================
+// ANÁLISE SINTÁTICA - Gramática
+// =============================================
+
+/** Programa: sequência de statements */
+void Program() :
+{}
+{
+    ( Statement() )* <EOF>
+}
+
+/** Statement genérico */
+void Statement() :
+{}
+{
+    Block()
+  | VarDeclaration()
+  | LOOKAHEAD(<FUNCTION> <IDENTIFIER>) FunctionDeclaration()
+  | ClassDeclaration()
+  | IfStatement()
+  | WhileStatement()
+  | DoWhileStatement()
+  | ForStatement()
+  | SwitchStatement()
+  | TryCatchStatement()
+  | ReturnStatement()
+  | BreakStatement()
+  | ContinueStatement()
+  | ThrowStatement()
+  | EmptyStatement()
+  | ExpressionStatement()
+}
+
+/** Bloco { ... } */
+void Block() :
+{}
+{
+    <LBRACE>
+    { enterScope(); }
+    ( Statement() )*
+    <RBRACE>
+    { exitScope(); }
+}
+
+/** Bloco sem criar novo escopo (para function body) */
+void FunctionBlock() :
+{}
+{
+    <LBRACE>
+    ( Statement() )*
+    <RBRACE>
+}
+
+/** ; vazio */
+void EmptyStatement() :
+{}
+{
+    <SEMICOLON>
+}
+
+// ---- Declarações de variáveis ----
+
+void VarDeclaration() :
+{ Token kind; }
+{
+    ( kind = <VAR> | kind = <LET> | kind = <CONST> )
+    VarDeclaratorList(kind.image)
+    ( <SEMICOLON> )?
+}
+
+void VarDeclaratorList(String kind) :
+{}
+{
+    VarDeclarator(kind)
+    ( <COMMA> VarDeclarator(kind) )*
+}
+
+void VarDeclarator(String kind) :
+{ Token t; }
+{
+    t = <IDENTIFIER>
+    { declareVar(t.image, kind); }
+    (
+        <ASSIGN> AssignmentExpression()
+    )?
+}
+
+// ---- Funções ----
+
+void FunctionDeclaration() :
+{ Token t; }
+{
+    <FUNCTION>
+    t = <IDENTIFIER>
+    { declareVar(t.image, "function"); }
+    <LPAREN>
+    { enterScope(); }
+    FormalParameters()
+    <RPAREN>
+    FunctionBlock()
+    { exitScope(); }
+}
+
+void FormalParameters() :
+{ Token t; }
+{
+    (
+        ( <SPREAD> )? t = <IDENTIFIER>
+        { declareVar(t.image, "param"); }
+        ( <ASSIGN> AssignmentExpression() )?
+        (
+            <COMMA>
+            ( <SPREAD> )? t = <IDENTIFIER>
+            { declareVar(t.image, "param"); }
+            ( <ASSIGN> AssignmentExpression() )?
+        )*
+    )?
+}
+
+// ---- Classe ----
+
+void ClassDeclaration() :
+{ Token t; }
+{
+    <CLASS> t = <IDENTIFIER>
+    { declareVar(t.image, "class"); }
+    ( <EXTENDS> Expression() )?
+    <LBRACE>
+    { enterScope(); }
+    ( ClassMember() )*
+    <RBRACE>
+    { exitScope(); }
+}
+
+void ClassMember() :
+{ Token t; }
+{
+    LOOKAHEAD(3)
+    (
+        // Constructor
+        "constructor" <LPAREN>
+        { enterScope(); }
+        FormalParameters()
+        <RPAREN>
+        FunctionBlock()
+        { exitScope(); }
+      |
+        // Método
+        ( "static" )? t = <IDENTIFIER>
+        <LPAREN>
+        { enterScope(); }
+        FormalParameters()
+        <RPAREN>
+        FunctionBlock()
+        { exitScope(); }
+    )
+}
+
+// ---- Controle de fluxo ----
+
+void IfStatement() :
+{}
+{
+    <IF> <LPAREN> Expression() <RPAREN>
+    Statement()
+    ( LOOKAHEAD(1) <ELSE> Statement() )?
+}
+
+void WhileStatement() :
+{}
+{
+    <WHILE> <LPAREN> Expression() <RPAREN>
+    Statement()
+}
+
+void DoWhileStatement() :
+{}
+{
+    <DO> Statement()
+    <WHILE> <LPAREN> Expression() <RPAREN>
+    ( <SEMICOLON> )?
+}
+
+void ForStatement() :
+{ Token t; }
+{
+    <FOR> <LPAREN>
+    { enterScope(); }
+    (
+        LOOKAHEAD(VarDeclarationInFor() ( <IN> | <OF> ))
+        VarDeclarationInFor() ( <IN> | <OF> ) Expression()
+      |
+        ForInit() <SEMICOLON>
+        ( Expression() )? <SEMICOLON>
+        ( Expression() )?
+    )
+    <RPAREN>
+    Statement()
+    { exitScope(); }
+}
+
+void VarDeclarationInFor() :
+{ Token kind; Token t; }
+{
+    ( kind = <VAR> | kind = <LET> | kind = <CONST> )
+    t = <IDENTIFIER>
+    { declareVar(t.image, kind.image); }
+}
+
+void VarDeclarationNoSemi() :
+{ Token kind; }
+{
+    ( kind = <VAR> | kind = <LET> | kind = <CONST> )
+    VarDeclaratorList(kind.image)
+}
+
+void ForInit() :
+{}
+{
+    LOOKAHEAD(<VAR> | <LET> | <CONST>)
+    VarDeclarationNoSemi()
+  |
+    ( ExpressionList() )?
+}
+
+void SwitchStatement() :
+{}
+{
+    <SWITCH> <LPAREN> Expression() <RPAREN>
+    <LBRACE>
+    { enterScope(); }
+    ( SwitchCase() )*
+    ( DefaultCase() )?
+    <RBRACE>
+    { exitScope(); }
+}
+
+void SwitchCase() :
+{}
+{
+    <CASE> Expression() <COLON>
+    ( LOOKAHEAD(2) Statement() )*
+}
+
+void DefaultCase() :
+{}
+{
+    <JS_DEFAULT> <COLON>
+    ( LOOKAHEAD(2) Statement() )*
+}
+
+void TryCatchStatement() :
+{ Token t; }
+{
+    <TRY>
+    Block()
+    (
+        <CATCH>
+        (
+            <LPAREN> t = <IDENTIFIER>
+            { enterScope(); declareVar(t.image, "catch"); }
+            <RPAREN>
+        )?
+        Block()
+        { if (!scopeStack.isEmpty()) exitScope(); }
+    )?
+    ( <FINALLY> Block() )?
+}
+
+void ReturnStatement() :
+{}
+{
+    <RETURN>
+    ( LOOKAHEAD(2) Expression() )?
+    ( <SEMICOLON> )?
+}
+
+void BreakStatement() :
+{}
+{
+    <BREAK>
+    ( LOOKAHEAD(<IDENTIFIER>) <IDENTIFIER> )?
+    ( <SEMICOLON> )?
+}
+
+void ContinueStatement() :
+{}
+{
+    <CONTINUE>
+    ( LOOKAHEAD(<IDENTIFIER>) <IDENTIFIER> )?
+    ( <SEMICOLON> )?
+}
+
+void ThrowStatement() :
+{}
+{
+    <THROW> Expression()
+    ( <SEMICOLON> )?
+}
+
+void ExpressionStatement() :
+{}
+{
+    ExpressionList()
+    ( <SEMICOLON> )?
+}
+
+void ExpressionList() :
+{}
+{
+    Expression()
+    ( <COMMA> Expression() )*
+}
+
+// =============================================
+// EXPRESSÕES
+// =============================================
+
+void Expression() :
+{}
+{
+    AssignmentExpression()
+}
+
+void AssignmentExpression() :
+{}
+{
+    LOOKAHEAD(ArrowFunctionParams() <ARROW>)
+    ArrowFunction()
+  |
+    LOOKAHEAD(ConditionalExpression() AssignOp())
+    LeftHandSideExpression() AssignOp() AssignmentExpression()
+  |
+    ConditionalExpression()
+}
+
+void ArrowFunctionParams() :
+{}
+{
+    <IDENTIFIER>
+  | <LPAREN> FormalParameters() <RPAREN>
+}
+
+void ArrowFunction() :
+{}
+{
+    { enterScope(); }
+    (
+        <IDENTIFIER>
+      | <LPAREN> FormalParameters() <RPAREN>
+    )
+    <ARROW>
+    (
+        FunctionBlock()
+      | AssignmentExpression()
+    )
+    { exitScope(); }
+}
+
+void AssignOp() :
+{}
+{
+    <ASSIGN>
+  | <PLUS_ASSIGN>
+  | <MINUS_ASSIGN>
+  | <TIMES_ASSIGN>
+  | <DIV_ASSIGN>
+  | <MOD_ASSIGN>
+  | <AND_ASSIGN>
+  | <OR_ASSIGN>
+}
+
+void ConditionalExpression() :
+{}
+{
+    LogicalOrExpression()
+    ( <QUESTION> AssignmentExpression() <COLON> AssignmentExpression() )?
+}
+
+void LogicalOrExpression() :
+{}
+{
+    LogicalAndExpression()
+    ( ( <OR> | <NULLCOAL> ) LogicalAndExpression() )*
+}
+
+void LogicalAndExpression() :
+{}
+{
+    BitwiseOrExpression()
+    ( <AND> BitwiseOrExpression() )*
+}
+
+void BitwiseOrExpression() :
+{}
+{
+    BitwiseXorExpression()
+    ( <PIPE> BitwiseXorExpression() )*
+}
+
+void BitwiseXorExpression() :
+{}
+{
+    BitwiseAndExpression()
+    ( <CARET> BitwiseAndExpression() )*
+}
+
+void BitwiseAndExpression() :
+{}
+{
+    EqualityExpression()
+    ( <AMP> EqualityExpression() )*
+}
+
+void EqualityExpression() :
+{}
+{
+    RelationalExpression()
+    ( ( <STRICT_EQ> | <STRICT_NEQ> | <EQ> | <NEQ> ) RelationalExpression() )*
+}
+
+void RelationalExpression() :
+{}
+{
+    ShiftExpression()
+    ( ( <LT> | <GT> | <LEQ> | <GEQ> | <INSTANCEOF> | <IN> ) ShiftExpression() )*
+}
+
+void ShiftExpression() :
+{}
+{
+    AdditiveExpression()
+    ( ( <LSHIFT> | <RSHIFT> | <URSHIFT> ) AdditiveExpression() )*
+}
+
+void AdditiveExpression() :
+{}
+{
+    MultiplicativeExpression()
+    ( ( <PLUS> | <MINUS> ) MultiplicativeExpression() )*
+}
+
+void MultiplicativeExpression() :
+{}
+{
+    UnaryExpression()
+    ( ( <TIMES> | <DIV> | <MOD> ) UnaryExpression() )*
+}
+
+void UnaryExpression() :
+{}
+{
+    ( <NOT> | <MINUS> | <PLUS> | <TILDE> | <TYPEOF> | <VOID> | <DELETE> )
+    UnaryExpression()
+  |
+    PostfixExpression()
+}
+
+void PostfixExpression() :
+{}
+{
+    LeftHandSideExpression()
+    (
+        LOOKAHEAD(2)
+        ( <PLUSPLUS> | <MINUSMINUS> )
+    )?
+}
+
+void LeftHandSideExpression() :
+{}
+{
+    ( <PLUSPLUS> | <MINUSMINUS> )? PrimaryExpression()
+    ( Suffix() )*
+}
+
+void Suffix() :
+{}
+{
+    <DOT> <IDENTIFIER>
+  | <OPT_CHAIN> <IDENTIFIER>
+  | <LBRACKET> Expression() <RBRACKET>
+  | <LPAREN> ArgumentList() <RPAREN>
+  | <PLUSPLUS>
+  | <MINUSMINUS>
+}
+
+void ArgumentList() :
+{}
+{
+    (
+        ( <SPREAD> )? AssignmentExpression()
+        ( <COMMA> ( <SPREAD> )? AssignmentExpression() )*
+    )?
+}
+
+void PrimaryExpression() :
+{ Token t; }
+{
+    t = <IDENTIFIER>
+    { checkVarUse(t.image); }
+  | <NUMBER>
+  | <STRING_DOUBLE>
+  | <STRING_SINGLE>
+  | <TEMPLATE_STR>
+  | <TRUE>
+  | <FALSE>
+  | <NULL>
+  | <UNDEFINED>
+  | <THIS>
+  | <SUPER>
+  | ArrayLiteral()
+  | ObjectLiteral()
+  | <NEW> Expression()
+  | <LPAREN>
+    (
+        LOOKAHEAD(ArrowFunctionParams() <ARROW>)
+        ArrowFunction()
+      |
+        Expression()
+    )
+    <RPAREN>
+  | FunctionExpression()
+}
+
+void FunctionExpression() :
+{ Token t; }
+{
+    <FUNCTION>
+    ( t = <IDENTIFIER>
+      { declareVar(t.image, "function"); }
+    )?
+    <LPAREN>
+    { enterScope(); }
+    FormalParameters()
+    <RPAREN>
+    FunctionBlock()
+    { exitScope(); }
+}
+
+void ArrayLiteral() :
+{}
+{
+    <LBRACKET>
+    (
+        ( <SPREAD> )? AssignmentExpression()
+        ( <COMMA> ( ( <SPREAD> )? AssignmentExpression() )? )*
+    )?
+    <RBRACKET>
+}
+
+void ObjectLiteral() :
+{}
+{
+    <LBRACE>
+    ( ObjectProperty()
+      ( <COMMA> ObjectProperty() )*
+      ( <COMMA> )?
+    )?
+    <RBRACE>
+}
+
+void ObjectProperty() :
+{ Token t; }
+{
+    LOOKAHEAD(<SPREAD>)
+    <SPREAD> AssignmentExpression()
+  |
+    LOOKAHEAD(<IDENTIFIER> <LPAREN>)
+    t = <IDENTIFIER>
+    <LPAREN>
+    { enterScope(); }
+    FormalParameters()
+    <RPAREN>
+    FunctionBlock()
+    { exitScope(); }
+  |
+    LOOKAHEAD((<IDENTIFIER> | <STRING_DOUBLE> | <STRING_SINGLE> | <NUMBER>) <COLON>)
+    ( t = <IDENTIFIER> | t = <STRING_DOUBLE> | t = <STRING_SINGLE> | t = <NUMBER> )
+    <COLON>
+    AssignmentExpression()
+  |
+    t = <IDENTIFIER>
+    { checkVarUse(t.image); }
+}
