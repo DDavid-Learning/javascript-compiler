@@ -7,7 +7,7 @@
  * Cobre:
  *  - Declarações: var, let, const
  *  - Funções: function, arrow functions básicas
- *  - Estruturas de controle: if/else, while, for, do-while, switch
+ *  - Estruturas de controle: if/else, for
  *  - Expressões: aritméticas, lógicas, relacionais, atribuição
  *  - Literais: number, string, boolean, null, undefined, array, object
  *  - Retorno e break/continue
@@ -15,6 +15,13 @@
  *  - Análise semântica básica: variáveis não declaradas, redeclaração com const
  */
 
+// =============================================
+// CONFIGURAÇÕES DO JAVACC
+// STATIC = false: cada instância do parser tem seu próprio estado,
+//   permitindo múltiplos parsers simultâneos sem conflito.
+// DEBUG_*: flags de depuração desativadas para produção;
+//   quando ativas, imprimem tokens e decisões do parser no console.
+// =============================================
 options {
     STATIC = false;
     DEBUG_PARSER = false;
@@ -22,6 +29,8 @@ options {
     DEBUG_TOKEN_MANAGER = false;
 }
 
+// PARSER_BEGIN/END delimita o código Java embutido no arquivo .jj.
+// Tudo aqui dentro é copiado literalmente para a classe gerada pelo JavaCC.
 PARSER_BEGIN(JavaScript)
 
 import java.util.*;
@@ -32,13 +41,23 @@ public class JavaScript {
     // =============================================
     // ANÁLISE SEMÂNTICA - Tabela de Símbolos
     // =============================================
+    // A tabela de símbolos é implementada como uma pilha de escopos (scopeStack).
+    // Cada escopo é um Map<String, String> que associa o nome da variável
+    // ao seu tipo de declaração ("var", "let", "const", "function", "param", etc.).
+    // Ao entrar em um bloco (função, if, for...), um novo Map é empilhado.
+    // Ao sair do bloco, o Map do topo é removido.
+    // Isso permite sombreamento de variáveis e escopo léxico correto.
 
-    // Pilha de escopos (cada escopo eh um Map nome->tipo)
+    // Pilha de escopos: topo = escopo mais interno, base = escopo global
     private Deque scopeStack = new ArrayDeque();
+    // Listas para acumular erros e avisos sem interromper a análise
     private List errosSemânticos = new ArrayList();
     private List avisosSemânticos = new ArrayList();
     private int erros = 0;
 
+    // Conjunto de identificadores globais do JavaScript que não precisam
+    // ser declarados pelo código-fonte analisado (built-ins da linguagem).
+    // Verificações semânticas ignoram esses nomes para evitar falsos positivos.
     private static final Set GLOBALS = new HashSet(Arrays.asList(new String[]{
         "console", "Math", "parseInt", "parseFloat", "isNaN", "isFinite",
         "String", "Number", "Boolean", "Array", "Object", "JSON",
@@ -47,19 +66,24 @@ public class JavaScript {
         "alert", "prompt", "confirm", "document", "window", "process"
     }));
 
-    /** Entra em um novo escopo */
+    /** Cria um novo Map vazio e empilha: representa a entrada em um bloco/escopo */
     private void enterScope() {
         scopeStack.push(new LinkedHashMap());
     }
 
-    /** Sai do escopo atual */
+    /** Remove o Map do topo da pilha: representa a saída de um bloco/escopo */
     private void exitScope() {
         if (!scopeStack.isEmpty()) {
             scopeStack.pop();
         }
     }
 
-    /** Declara uma variável no escopo atual */
+    /**
+     * Registra uma nova variável no escopo mais interno (topo da pilha).
+     * - Se já existe no mesmo escopo com "const" (ou a nova declaração é "const"),
+     *   gera ERRO pois const não pode ser redeclarado.
+     * - Caso contrário (var/let redeclarados), gera apenas AVISO.
+     */
     private void declareVar(String name, String kind) {
         if (scopeStack.isEmpty()) return;
         Map current = (Map) scopeStack.peek();
@@ -74,7 +98,10 @@ public class JavaScript {
         current.put(name, kind);
     }
 
-    /** Verifica se uma variável está declarada em algum escopo */
+    /**
+     * Percorre todos os escopos da pilha (do mais interno ao global)
+     * procurando a variável pelo nome. Implementa a resolução léxica de escopos.
+     */
     private boolean isVarDeclared(String name) {
         for (Object obj : scopeStack) {
             Map scope = (Map) obj;
@@ -83,22 +110,29 @@ public class JavaScript {
         return false;
     }
 
-    /** Verifica uso de variável e registra erro se não declarada */
+    /**
+     * Chamado toda vez que um identificador é usado em uma expressão.
+     * Ignora globals do JS e verifica se a variável foi declarada em algum escopo.
+     * Se não foi, registra erro semântico de "variável não declarada".
+     */
     private void checkVarUse(String name) {
         if (!GLOBALS.contains(name) && !isVarDeclared(name)) {
             erroSemantico("Variável '" + name + "' utilizada sem declaração");
         }
     }
 
+    // Incrementa o contador de erros e acumula a mensagem formatada
     private void erroSemantico(String msg) {
         erros++;
         errosSemânticos.add("[ERRO SEMÂNTICO] " + msg);
     }
 
+    // Acumula avisos sem incrementar o contador de erros fatais
     private void avisoSemantico(String msg) {
         avisosSemânticos.add("[AVISO SEMÂNTICO] " + msg);
     }
 
+    // Exibe no console o relatório final: avisos, erros e resumo com contagens
     private void imprimirResultados() {
         System.out.println("\n========================================");
         System.out.println("     RESULTADO DA ANÁLISE");
@@ -126,6 +160,20 @@ public class JavaScript {
     // MAIN
     // =============================================
 
+    /**
+     * Ponto de entrada do compilador.
+     *
+     * Fluxo:
+     *  1. Configura stdout/stderr para UTF-8 (suporte a acentos).
+     *  2. Lê o arquivo .js passado como argumento, ou usa stdin se omitido.
+     *  3. Instancia o parser gerado pelo JavaCC apontando para o stream de entrada.
+     *  4. Abre o escopo global, executa a regra raiz Program() e fecha o escopo.
+     *  5. Em caso de sucesso, imprime o relatório da análise semântica.
+     *
+     * Exceções tratadas:
+     *  - ParseException  → erro sintático (token inesperado na gramática)
+     *  - TokenMgrError   → erro léxico (caractere inválido / token não reconhecido)
+     */
     public static void main(String[] args) throws Exception {
         System.setOut(new PrintStream(System.out, true, "UTF-8"));
         System.setErr(new PrintStream(System.err, true, "UTF-8"));
@@ -144,7 +192,7 @@ public class JavaScript {
 
         JavaScript parser = new JavaScript(input);
         try {
-            parser.enterScope(); // escopo global
+            parser.enterScope(); // abre o escopo global antes de analisar o programa
             parser.Program();
             parser.exitScope();
             System.out.println("\n[OK] Análise léxica e sintática concluída sem erros.");
@@ -166,23 +214,33 @@ PARSER_END(JavaScript)
 // =============================================
 // ANÁLISE LÉXICA - Tokens
 // =============================================
+// Esta seção define as regras do analisador léxico (tokenizer/scanner).
+// O JavaCC gera um DFA (autômato finito determinístico) a partir dessas regras.
+// A ordem das declarações importa: palavras reservadas devem ser reconhecidas
+// antes de IDENTIFIER, e operadores compostos antes dos operadores simples.
+// =============================================
 
-// Ignorar espaços, tabs e quebras de linha
+// SKIP: padrões que o lexer consome e descarta sem gerar token.
+// Espaços em branco e quebras de linha são ignorados entre tokens.
 SKIP : {
     " " | "\t" | "\r" | "\n" | "\f"
 }
 
-// Comentários de linha
+// Comentários de linha: tudo após "//" até o fim da linha é descartado.
 SKIP : {
     <LINE_COMMENT: "//" (~["\n","\r"])* ("\n"|"\r"|"\r\n")?>
 }
 
-// Comentários de bloco
+// Comentários de bloco: tudo entre "/*" e "*/" é descartado.
+// O padrão (~["*"] | ("*" ~["/"])) garante que "*/" termine o comentário
+// mas "*" sozinho dentro do bloco é permitido.
 SKIP : {
     <BLOCK_COMMENT: "/*" (~["*"] | ("*" ~["/"]))* "*/">
 }
 
-// Palavras reservadas
+// Palavras reservadas da linguagem JavaScript.
+// Declaradas antes de IDENTIFIER para que o lexer as reconheça como
+// tokens específicos e não como identificadores genéricos.
 TOKEN : {
     <VAR:        "var">
   | <LET:        "let">
@@ -191,14 +249,9 @@ TOKEN : {
   | <RETURN:     "return">
   | <IF:         "if">
   | <ELSE:       "else">
-  | <WHILE:      "while">
-  | <DO:         "do">
   | <FOR:        "for">
   | <BREAK:      "break">
   | <CONTINUE:   "continue">
-  | <SWITCH:     "switch">
-  | <CASE:       "case">
-  | <JS_DEFAULT: "default">
   | <NEW:        "new">
   | <TYPEOF:     "typeof">
   | <INSTANCEOF: "instanceof">
@@ -219,7 +272,9 @@ TOKEN : {
   | <VOID:       "void">
 }
 
-// Literais booleanos e especiais
+// Literais booleanos e especiais do JavaScript.
+// Separados das palavras reservadas por clareza semântica,
+// mas igualmente precisam vir antes de IDENTIFIER.
 TOKEN : {
     <TRUE:      "true">
   | <FALSE:     "false">
@@ -227,52 +282,61 @@ TOKEN : {
   | <UNDEFINED: "undefined">
 }
 
-// Número inteiro e decimal
+// Literais numéricos: inteiros, decimais e notação científica.
+// Exemplos válidos: 42  3.14  1e10  2.5E-3
 TOKEN : {
     <NUMBER: (["0"-"9"])+ ("." (["0"-"9"])+)? (["e","E"] (["+","-"])? (["0"-"9"])+)?>
 }
 
-// String com aspas simples ou duplas
+// Literais de string em três formatos:
+//  - STRING_DOUBLE: delimitada por aspas duplas, suporta escape (\")
+//  - STRING_SINGLE: delimitada por aspas simples, suporta escape (\')
+//  - TEMPLATE_STR:  template literal com crase, suporta ${...} e escape
 TOKEN : {
     <STRING_DOUBLE: "\"" (~["\"","\\","\n","\r"] | "\\" ~[])* "\"">
   | <STRING_SINGLE: "'" (~["'","\\","\n","\r"] | "\\" ~[])* "'">
   | <TEMPLATE_STR:  "`" (~["`","\\","$"] | "\\~[]" | "${" (~["}"])* "}")* "`">
 }
 
-// Identificador
+// Identificadores: começam com letra, underscore ou $,
+// seguidos de letras, dígitos, underscore ou $.
+// Declarado APÓS as palavras reservadas para que estas tenham precedência.
 TOKEN : {
     <IDENTIFIER: ["a"-"z","A"-"Z","_","$"] (["a"-"z","A"-"Z","0"-"9","_","$"])* >
 }
 
-// Operadores compostos (devem vir antes dos simples)
+// Operadores compostos (multi-caractere).
+// DEVEM vir antes dos operadores simples para que o lexer faça o match mais longo
+// (maximal munch): ex. "===" deve ser reconhecido antes de "==" e "=".
 TOKEN : {
-    <STRICT_EQ:     "===">
-  | <STRICT_NEQ:    "!==">
-  | <EQ:            "==">
-  | <NEQ:           "!=">
-  | <PLUSPLUS:      "++">
-  | <MINUSMINUS:    "--">
+    <STRICT_EQ:     "===">   // igualdade estrita (sem coerção de tipo)
+  | <STRICT_NEQ:    "!==">   // diferença estrita
+  | <EQ:            "==">    // igualdade com coerção
+  | <NEQ:           "!=">    // diferença com coerção
+  | <PLUSPLUS:      "++">    // incremento
+  | <MINUSMINUS:    "--">    // decremento
   | <PLUS_ASSIGN:   "+=">
   | <MINUS_ASSIGN:  "-=">
   | <TIMES_ASSIGN:  "*=">
   | <DIV_ASSIGN:    "/=">
   | <MOD_ASSIGN:    "%=">
-  | <AND_ASSIGN:    "&&=">
-  | <OR_ASSIGN:     "||=">
-  | <LSHIFT:        "<<">
-  | <RSHIFT:        ">>">
-  | <URSHIFT:       ">>>">
-  | <LEQ:           "<=">
-  | <GEQ:           ">=">
-  | <AND:           "&&">
-  | <OR:            "||">
-  | <NULLCOAL:      "??">
-  | <ARROW:         "=>">
-  | <SPREAD:        "...">
-  | <OPT_CHAIN:     "?.">
+  | <AND_ASSIGN:    "&&=">   // atribuição lógica AND (ES2021)
+  | <OR_ASSIGN:     "||=">   // atribuição lógica OR  (ES2021)
+  | <LSHIFT:        "<<">    // deslocamento à esquerda
+  | <RSHIFT:        ">>">    // deslocamento à direita com sinal
+  | <URSHIFT:       ">>>">   // deslocamento à direita sem sinal (unsigned)
+  | <LEQ:           "<=">    // menor ou igual
+  | <GEQ:           ">=">    // maior ou igual
+  | <AND:           "&&">    // E lógico
+  | <OR:            "||">    // OU lógico
+  | <NULLCOAL:      "??">    // operador de coalescência nula (ES2020)
+  | <ARROW:         "=>">    // arrow function
+  | <SPREAD:        "...">   // spread/rest operator
+  | <OPT_CHAIN:     "?.">    // optional chaining (ES2020)
 }
 
-// Operadores simples e pontuação
+// Operadores simples (um caractere) e pontuação.
+// Declarados por último para não "engolir" o início de operadores compostos.
 TOKEN : {
     <ASSIGN:    "=">
   | <LT:        "<">
@@ -283,12 +347,12 @@ TOKEN : {
   | <DIV:       "/">
   | <MOD:       "%">
   | <NOT:       "!">
-  | <TILDE:     "~">
-  | <AMP:       "&">
-  | <PIPE:      "|">
-  | <CARET:     "^">
-  | <QUESTION:  "?">
-  | <COLON:     ":">
+  | <TILDE:     "~">    // NOT bit a bit
+  | <AMP:       "&">    // AND bit a bit
+  | <PIPE:      "|">    // OR bit a bit
+  | <CARET:     "^">    // XOR bit a bit
+  | <QUESTION:  "?">    // operador ternário (parte 1)
+  | <COLON:     ":">    // operador ternário (parte 2) / rótulo de case
   | <SEMICOLON: ";">
   | <COMMA:     ",">
   | <DOT:       ".">
@@ -304,15 +368,29 @@ TOKEN : {
 // =============================================
 // ANÁLISE SINTÁTICA - Gramática
 // =============================================
+// As regras abaixo formam a gramática LL(k) do subconjunto de JavaScript.
+// Cada regra "void NomeRegra() : { declarações } { produções }" corresponde
+// a um não-terminal da gramática.
+// LOOKAHEAD(n) instrui o parser a usar n tokens de antecipação para resolver
+// ambiguidades que não podem ser resolvidas com apenas 1 token (padrão LL(1)).
+// =============================================
 
-/** Programa: sequência de statements */
+/** Regra raiz: um programa é uma sequência de zero ou mais statements até o EOF */
 void Program() :
 {}
 {
     ( Statement() )* <EOF>
 }
 
-/** Statement genérico */
+/**
+ * Statement genérico: ponto de despacho para todos os tipos de instrução.
+ * A ordem das alternativas importa para a eficiência; alternativas com
+ * LOOKAHEAD têm custo extra pois exigem mais tokens de antecipação.
+ *
+ * LOOKAHEAD(<FUNCTION> <IDENTIFIER>): distingue declaração de função
+ * (function foo() {}) de expressão de função ((function() {})()), pois
+ * ambas começam com "function" mas apenas a declaração tem identificador logo após.
+ */
 void Statement() :
 {}
 {
@@ -321,20 +399,21 @@ void Statement() :
   | LOOKAHEAD(<FUNCTION> <IDENTIFIER>) FunctionDeclaration()
   | ClassDeclaration()
   | IfStatement()
-  | WhileStatement()
-  | DoWhileStatement()
   | ForStatement()
-  | SwitchStatement()
   | TryCatchStatement()
   | ReturnStatement()
   | BreakStatement()
   | ContinueStatement()
   | ThrowStatement()
   | EmptyStatement()
-  | ExpressionStatement()
+  | ExpressionStatement()    // fallback: qualquer expressão seguida de ";"
 }
 
-/** Bloco { ... } */
+/**
+ * Bloco de código delimitado por chaves.
+ * Cria um novo escopo semântico ao entrar e o destrói ao sair,
+ * garantindo que variáveis declaradas dentro não vazem para fora.
+ */
 void Block() :
 {}
 {
@@ -345,7 +424,12 @@ void Block() :
     { exitScope(); }
 }
 
-/** Bloco sem criar novo escopo (para function body) */
+/**
+ * Corpo de função: igual a Block() mas SEM criar novo escopo.
+ * O escopo da função já foi aberto em FunctionDeclaration/FunctionExpression
+ * antes de chamar este método, para que os parâmetros formais pertençam
+ * ao mesmo escopo que o corpo da função.
+ */
 void FunctionBlock() :
 {}
 {
@@ -354,7 +438,7 @@ void FunctionBlock() :
     <RBRACE>
 }
 
-/** ; vazio */
+/** Instrução vazia: apenas um ponto-e-vírgula (ex.: for(;;); ) */
 void EmptyStatement() :
 {}
 {
@@ -363,6 +447,11 @@ void EmptyStatement() :
 
 // ---- Declarações de variáveis ----
 
+/**
+ * Declaração com var/let/const.
+ * Captura o tipo (kind) para repassar à tabela de símbolos.
+ * O ponto-e-vírgula final é opcional (ASI - Automatic Semicolon Insertion).
+ */
 void VarDeclaration() :
 { Token kind; }
 {
@@ -371,6 +460,11 @@ void VarDeclaration() :
     ( <SEMICOLON> )?
 }
 
+/**
+ * Lista de declaradores separados por vírgula: let a = 1, b, c = 3
+ * O kind (var/let/const) é propagado para que cada declarador
+ * registre o tipo correto na tabela de símbolos.
+ */
 void VarDeclaratorList(String kind) :
 {}
 {
@@ -378,6 +472,11 @@ void VarDeclaratorList(String kind) :
     ( <COMMA> VarDeclarator(kind) )*
 }
 
+/**
+ * Um único declarador: nome e inicializador opcional.
+ * Registra a variável na tabela de símbolos ANTES de avaliar o inicializador,
+ * permitindo self-reference (ex.: var x = x || 0).
+ */
 void VarDeclarator(String kind) :
 { Token t; }
 {
@@ -390,27 +489,42 @@ void VarDeclarator(String kind) :
 
 // ---- Funções ----
 
+/**
+ * Declaração de função nomeada: function foo(params) { body }
+ *
+ * O nome da função é declarado NO ESCOPO EXTERNO (antes de enterScope),
+ * tornando-a visível fora do bloco — comportamento de hoisting do JavaScript.
+ * Um novo escopo é aberto logo após para conter os parâmetros e o corpo.
+ */
 void FunctionDeclaration() :
 { Token t; }
 {
     <FUNCTION>
     t = <IDENTIFIER>
-    { declareVar(t.image, "function"); }
+    { declareVar(t.image, "function"); }   // declara no escopo externo (hoisting)
     <LPAREN>
-    { enterScope(); }
+    { enterScope(); }                       // abre escopo para params + corpo
     FormalParameters()
     <RPAREN>
     FunctionBlock()
     { exitScope(); }
 }
 
+/**
+ * Lista de parâmetros formais entre parênteses.
+ * Suporta:
+ *  - Parâmetros simples:         (a, b)
+ *  - Valores padrão:             (a, b = 10)
+ *  - Rest parameter (último):    (...args)
+ * Cada parâmetro é declarado com kind="param" no escopo da função.
+ */
 void FormalParameters() :
 { Token t; }
 {
     (
         ( <SPREAD> )? t = <IDENTIFIER>
         { declareVar(t.image, "param"); }
-        ( <ASSIGN> AssignmentExpression() )?
+        ( <ASSIGN> AssignmentExpression() )?   // valor padrão opcional
         (
             <COMMA>
             ( <SPREAD> )? t = <IDENTIFIER>
@@ -422,12 +536,19 @@ void FormalParameters() :
 
 // ---- Classe ----
 
+/**
+ * Declaração de classe: class Foo [extends Bar] { members }
+ *
+ * O nome da classe é declarado no escopo externo (similar à função).
+ * A herança (extends) é uma expressão arbitrária, permitindo mixins.
+ * Um novo escopo é aberto para os membros da classe.
+ */
 void ClassDeclaration() :
 { Token t; }
 {
     <CLASS> t = <IDENTIFIER>
     { declareVar(t.image, "class"); }
-    ( <EXTENDS> Expression() )?
+    ( <EXTENDS> Expression() )?        // herança opcional
     <LBRACE>
     { enterScope(); }
     ( ClassMember() )*
@@ -435,12 +556,22 @@ void ClassDeclaration() :
     { exitScope(); }
 }
 
+/**
+ * Membro de classe: constructor ou método (com suporte a "static").
+ *
+ * LOOKAHEAD(3) é necessário porque tanto "constructor" quanto métodos
+ * podem ser identificadores seguidos de "(", e o parser precisa
+ * de 3 tokens para distinguir "static nomeMétodo(" de "nomeMétodo(".
+ *
+ * Cada método abre seu próprio escopo para os parâmetros e o corpo.
+ */
 void ClassMember() :
 { Token t; }
 {
     LOOKAHEAD(3)
     (
-        // Constructor
+        // Construtor da classe — recebe "constructor" como string literal
+        // pois JavaCC não reconhece "constructor" como palavra reservada Java
         "constructor" <LPAREN>
         { enterScope(); }
         FormalParameters()
@@ -448,7 +579,7 @@ void ClassMember() :
         FunctionBlock()
         { exitScope(); }
       |
-        // Método
+        // Método de instância ou estático: [static] nome(params) { body }
         ( "static" )? t = <IDENTIFIER>
         <LPAREN>
         { enterScope(); }
@@ -461,6 +592,11 @@ void ClassMember() :
 
 // ---- Controle de fluxo ----
 
+/**
+ * if (cond) stmt [else stmt]
+ * LOOKAHEAD(1) no else resolve o "dangling else": o else é sempre
+ * associado ao if mais interno (comportamento padrão do JavaScript).
+ */
 void IfStatement() :
 {}
 {
@@ -469,21 +605,16 @@ void IfStatement() :
     ( LOOKAHEAD(1) <ELSE> Statement() )?
 }
 
-void WhileStatement() :
-{}
-{
-    <WHILE> <LPAREN> Expression() <RPAREN>
-    Statement()
-}
-
-void DoWhileStatement() :
-{}
-{
-    <DO> Statement()
-    <WHILE> <LPAREN> Expression() <RPAREN>
-    ( <SEMICOLON> )?
-}
-
+/**
+ * Laço for em três variantes:
+ *  1. for (var/let/const x in obj)  — itera sobre chaves do objeto
+ *  2. for (var/let/const x of iter) — itera sobre valores do iterável
+ *  3. for (init; cond; update)      — laço tradicional com três cláusulas
+ *
+ * Um escopo é aberto para o for todo (init/var pertence a ele),
+ * garantindo que variáveis declaradas no for não vazem para fora.
+ * LOOKAHEAD verifica se é for-in/of antes de tentar o laço clássico.
+ */
 void ForStatement() :
 { Token t; }
 {
@@ -502,6 +633,10 @@ void ForStatement() :
     { exitScope(); }
 }
 
+/**
+ * Declaração de variável de iteração do for-in/of (sem ponto-e-vírgula).
+ * Registra a variável de iteração no escopo do for.
+ */
 void VarDeclarationInFor() :
 { Token kind; Token t; }
 {
@@ -510,6 +645,10 @@ void VarDeclarationInFor() :
     { declareVar(t.image, kind.image); }
 }
 
+/**
+ * Declaração de variável sem ponto-e-vírgula final.
+ * Usada na cláusula de inicialização do for clássico: for (let i = 0; ...)
+ */
 void VarDeclarationNoSemi() :
 { Token kind; }
 {
@@ -517,6 +656,11 @@ void VarDeclarationNoSemi() :
     VarDeclaratorList(kind.image)
 }
 
+/**
+ * Cláusula de inicialização do for clássico.
+ * Pode ser uma declaração de variável ou uma lista de expressões (ou vazio).
+ * LOOKAHEAD para decidir entre declaração e expressão.
+ */
 void ForInit() :
 {}
 {
@@ -526,32 +670,16 @@ void ForInit() :
     ( ExpressionList() )?
 }
 
-void SwitchStatement() :
-{}
-{
-    <SWITCH> <LPAREN> Expression() <RPAREN>
-    <LBRACE>
-    { enterScope(); }
-    ( SwitchCase() )*
-    ( DefaultCase() )?
-    <RBRACE>
-    { exitScope(); }
-}
-
-void SwitchCase() :
-{}
-{
-    <CASE> Expression() <COLON>
-    ( LOOKAHEAD(2) Statement() )*
-}
-
-void DefaultCase() :
-{}
-{
-    <JS_DEFAULT> <COLON>
-    ( LOOKAHEAD(2) Statement() )*
-}
-
+/**
+ * try { } [catch [(e)] { }] [finally { }]
+ *
+ * A variável de exceção (catch binding) é declarada com kind="catch"
+ * em um escopo específico que é aberto antes e fechado depois do bloco catch.
+ * O catch binding é opcional desde ES2019 (optional catch binding).
+ *
+ * Nota: o exitScope do catch é feito manualmente aqui porque o escopo
+ * foi aberto fora do Block() (para incluir a variável de exceção).
+ */
 void TryCatchStatement() :
 { Token t; }
 {
@@ -565,11 +693,15 @@ void TryCatchStatement() :
             <RPAREN>
         )?
         Block()
-        { if (!scopeStack.isEmpty()) exitScope(); }
+        { if (!scopeStack.isEmpty()) exitScope(); }   // fecha escopo do catch binding
     )?
     ( <FINALLY> Block() )?
 }
 
+/**
+ * return [expr];
+ * LOOKAHEAD(2) evita consumir o ";" de um EmptyStatement como início de expressão.
+ */
 void ReturnStatement() :
 {}
 {
@@ -578,6 +710,10 @@ void ReturnStatement() :
     ( <SEMICOLON> )?
 }
 
+/**
+ * break [label];
+ * O label opcional permite sair de laços rotulados (ex.: outer: for...).
+ */
 void BreakStatement() :
 {}
 {
@@ -586,6 +722,7 @@ void BreakStatement() :
     ( <SEMICOLON> )?
 }
 
+/** continue [label]; — pula para a próxima iteração do laço (rotulado ou não) */
 void ContinueStatement() :
 {}
 {
@@ -594,6 +731,7 @@ void ContinueStatement() :
     ( <SEMICOLON> )?
 }
 
+/** throw expr; — lança uma exceção */
 void ThrowStatement() :
 {}
 {
@@ -601,6 +739,10 @@ void ThrowStatement() :
     ( <SEMICOLON> )?
 }
 
+/**
+ * Instrução de expressão: uma expressão usada como statement.
+ * Exemplos: chamadas de função (foo()), atribuições (x = 1), incrementos (i++).
+ */
 void ExpressionStatement() :
 {}
 {
@@ -608,6 +750,11 @@ void ExpressionStatement() :
     ( <SEMICOLON> )?
 }
 
+/**
+ * Lista de expressões separadas por vírgula.
+ * Usada em ExpressionStatement e na cláusula de atualização do for.
+ * O valor da lista é o valor da última expressão (operador vírgula do JS).
+ */
 void ExpressionList() :
 {}
 {
@@ -618,13 +765,42 @@ void ExpressionList() :
 // =============================================
 // EXPRESSÕES
 // =============================================
+// A hierarquia de expressões segue a precedência de operadores do JavaScript,
+// do menor para o maior precedência (de cima para baixo na cadeia de chamadas):
+//
+//   Expression
+//     └─ AssignmentExpression  (=, +=, ..., arrow)
+//          └─ ConditionalExpression  (? :)
+//               └─ LogicalOrExpression   (||, ??)
+//                    └─ LogicalAndExpression  (&&)
+//                         └─ BitwiseOrExpression  (|)
+//                              └─ BitwiseXorExpression  (^)
+//                                   └─ BitwiseAndExpression  (&)
+//                                        └─ EqualityExpression  (==, ===, !=, !==)
+//                                             └─ RelationalExpression  (<, >, instanceof, in)
+//                                                  └─ ShiftExpression  (<<, >>, >>>)
+//                                                       └─ AdditiveExpression  (+, -)
+//                                                            └─ MultiplicativeExpression  (*, /, %)
+//                                                                 └─ UnaryExpression  (!, -, typeof...)
+//                                                                      └─ PostfixExpression  (x++, x--)
+//                                                                           └─ LeftHandSideExpression
+//                                                                                └─ PrimaryExpression
+// =============================================
 
+/** Ponto de entrada das expressões — delega para AssignmentExpression */
 void Expression() :
 {}
 {
     AssignmentExpression()
 }
 
+/**
+ * Expressão de atribuição, com três alternativas (ordem importa):
+ *  1. Arrow function: identificado por LOOKAHEAD antes de consumir tokens.
+ *  2. Atribuição: lvalue op= rvalue  (ex.: x += 1, obj.a = 2).
+ *     LOOKAHEAD garante que só toma este caminho quando há um operador de atribuição.
+ *  3. Expressão condicional (fallback mais comum).
+ */
 void AssignmentExpression() :
 {}
 {
@@ -637,6 +813,10 @@ void AssignmentExpression() :
     ConditionalExpression()
 }
 
+/**
+ * Parâmetros de arrow function para uso no LOOKAHEAD.
+ * Duas formas: identificador simples (x =>) ou lista entre parênteses ((a, b) =>).
+ */
 void ArrowFunctionParams() :
 {}
 {
@@ -644,6 +824,12 @@ void ArrowFunctionParams() :
   | <LPAREN> FormalParameters() <RPAREN>
 }
 
+/**
+ * Arrow function: params => body
+ * O corpo pode ser um bloco { } (com return explícito) ou
+ * uma expressão direta (retorno implícito).
+ * O escopo é aberto antes de processar os parâmetros e fechado ao final.
+ */
 void ArrowFunction() :
 {}
 {
@@ -654,12 +840,13 @@ void ArrowFunction() :
     )
     <ARROW>
     (
-        FunctionBlock()
-      | AssignmentExpression()
+        FunctionBlock()          // ex.: (x) => { return x * 2; }
+      | AssignmentExpression()   // ex.: (x) => x * 2
     )
     { exitScope(); }
 }
 
+/** Todos os operadores de atribuição suportados */
 void AssignOp() :
 {}
 {
@@ -673,6 +860,10 @@ void AssignOp() :
   | <OR_ASSIGN>
 }
 
+/**
+ * Operador ternário: cond ? exprTrue : exprFalse
+ * Se não houver "?", delega diretamente para LogicalOrExpression.
+ */
 void ConditionalExpression() :
 {}
 {
@@ -680,6 +871,10 @@ void ConditionalExpression() :
     ( <QUESTION> AssignmentExpression() <COLON> AssignmentExpression() )?
 }
 
+/**
+ * Operadores de menor precedência depois de atribuição/ternário:
+ * || (OR lógico) e ?? (nullish coalescing — retorna o lado direito se esquerdo é null/undefined).
+ */
 void LogicalOrExpression() :
 {}
 {
@@ -687,6 +882,7 @@ void LogicalOrExpression() :
     ( ( <OR> | <NULLCOAL> ) LogicalAndExpression() )*
 }
 
+/** && (AND lógico) — maior precedência que || */
 void LogicalAndExpression() :
 {}
 {
@@ -694,6 +890,7 @@ void LogicalAndExpression() :
     ( <AND> BitwiseOrExpression() )*
 }
 
+/** | (OR bit a bit) */
 void BitwiseOrExpression() :
 {}
 {
@@ -701,6 +898,7 @@ void BitwiseOrExpression() :
     ( <PIPE> BitwiseXorExpression() )*
 }
 
+/** ^ (XOR bit a bit) */
 void BitwiseXorExpression() :
 {}
 {
@@ -708,6 +906,7 @@ void BitwiseXorExpression() :
     ( <CARET> BitwiseAndExpression() )*
 }
 
+/** & (AND bit a bit) */
 void BitwiseAndExpression() :
 {}
 {
@@ -715,6 +914,7 @@ void BitwiseAndExpression() :
     ( <AMP> EqualityExpression() )*
 }
 
+/** Operadores de igualdade: == != === !== */
 void EqualityExpression() :
 {}
 {
@@ -722,6 +922,7 @@ void EqualityExpression() :
     ( ( <STRICT_EQ> | <STRICT_NEQ> | <EQ> | <NEQ> ) RelationalExpression() )*
 }
 
+/** Operadores relacionais e de tipo: < > <= >= instanceof in */
 void RelationalExpression() :
 {}
 {
@@ -729,6 +930,7 @@ void RelationalExpression() :
     ( ( <LT> | <GT> | <LEQ> | <GEQ> | <INSTANCEOF> | <IN> ) ShiftExpression() )*
 }
 
+/** Operadores de deslocamento de bits: << >> >>> */
 void ShiftExpression() :
 {}
 {
@@ -736,6 +938,7 @@ void ShiftExpression() :
     ( ( <LSHIFT> | <RSHIFT> | <URSHIFT> ) AdditiveExpression() )*
 }
 
+/** Adição e subtração */
 void AdditiveExpression() :
 {}
 {
@@ -743,6 +946,7 @@ void AdditiveExpression() :
     ( ( <PLUS> | <MINUS> ) MultiplicativeExpression() )*
 }
 
+/** Multiplicação, divisão e módulo — maior precedência que + e - */
 void MultiplicativeExpression() :
 {}
 {
@@ -750,6 +954,12 @@ void MultiplicativeExpression() :
     ( ( <TIMES> | <DIV> | <MOD> ) UnaryExpression() )*
 }
 
+/**
+ * Expressões unárias (prefixo):
+ * ! (not lógico), - (negação aritmética), + (positivo), ~ (not bit a bit),
+ * typeof, void, delete — todos com associatividade à direita (recursivo).
+ * Se não for unário, delega para PostfixExpression.
+ */
 void UnaryExpression() :
 {}
 {
@@ -759,6 +969,11 @@ void UnaryExpression() :
     PostfixExpression()
 }
 
+/**
+ * Expressão com operadores de incremento/decremento pós-fixo: x++, x--
+ * LOOKAHEAD(2) é necessário porque ++ e -- também podem aparecer
+ * como prefixo em LeftHandSideExpression (ex.: ++x).
+ */
 void PostfixExpression() :
 {}
 {
@@ -769,6 +984,11 @@ void PostfixExpression() :
     )?
 }
 
+/**
+ * Expressão de lado esquerdo (lvalue): o que pode aparecer à esquerda de "=".
+ * Suporta incremento/decremento pré-fixo (++x, --x) e uma sequência de
+ * sufixos (acesso a membro, chamada de função, índice de array).
+ */
 void LeftHandSideExpression() :
 {}
 {
@@ -776,6 +996,14 @@ void LeftHandSideExpression() :
     ( Suffix() )*
 }
 
+/**
+ * Sufixos encadeáveis após uma expressão primária:
+ *  .prop        — acesso a membro
+ *  ?.prop       — optional chaining
+ *  [expr]       — acesso por índice
+ *  (args)       — chamada de função
+ *  ++ / --      — incremento/decremento pós-fixo (alternativa ao PostfixExpression)
+ */
 void Suffix() :
 {}
 {
@@ -787,6 +1015,10 @@ void Suffix() :
   | <MINUSMINUS>
 }
 
+/**
+ * Lista de argumentos de uma chamada de função.
+ * Suporta spread (...arr) em qualquer posição da lista.
+ */
 void ArgumentList() :
 {}
 {
@@ -796,11 +1028,21 @@ void ArgumentList() :
     )?
 }
 
+/**
+ * Expressão primária: o nível mais básico, não decomponível.
+ * Cobre todos os tipos de literais, identificadores, agrupamento e sub-expressões.
+ *
+ * Identificadores são verificados semanticamente (checkVarUse) para
+ * detectar variáveis não declaradas no ponto de uso.
+ *
+ * O LPAREN pode iniciar tanto um agrupamento simples (expr) quanto
+ * uma arrow function; LOOKAHEAD decide qual caminho tomar.
+ */
 void PrimaryExpression() :
 { Token t; }
 {
     t = <IDENTIFIER>
-    { checkVarUse(t.image); }
+    { checkVarUse(t.image); }      // verifica se a variável foi declarada
   | <NUMBER>
   | <STRING_DOUBLE>
   | <STRING_SINGLE>
@@ -813,24 +1055,29 @@ void PrimaryExpression() :
   | <SUPER>
   | ArrayLiteral()
   | ObjectLiteral()
-  | <NEW> Expression()
+  | <NEW> Expression()             // new Classe(args)
   | <LPAREN>
     (
         LOOKAHEAD(ArrowFunctionParams() <ARROW>)
         ArrowFunction()
       |
-        Expression()
+        Expression()               // expressão agrupada: (1 + 2) * 3
     )
     <RPAREN>
-  | FunctionExpression()
+  | FunctionExpression()           // function [nome](params) { body }
 }
 
+/**
+ * Expressão de função (anônima ou nomeada).
+ * Diferente de FunctionDeclaration, o nome (se presente) é declarado
+ * dentro do escopo da função (recursão pelo nome), não no escopo externo.
+ */
 void FunctionExpression() :
 { Token t; }
 {
     <FUNCTION>
     ( t = <IDENTIFIER>
-      { declareVar(t.image, "function"); }
+      { declareVar(t.image, "function"); }   // nome visível apenas dentro da função
     )?
     <LPAREN>
     { enterScope(); }
@@ -840,6 +1087,11 @@ void FunctionExpression() :
     { exitScope(); }
 }
 
+/**
+ * Literal de array: [elem1, elem2, ...spread]
+ * Elementos podem ser omitidos (sparse array): [1,,3] é válido em JS.
+ * Suporta spread em qualquer posição.
+ */
 void ArrayLiteral() :
 {}
 {
@@ -851,6 +1103,10 @@ void ArrayLiteral() :
     <RBRACKET>
 }
 
+/**
+ * Literal de objeto: { chave: valor, método() {}, shorthand, ...spread }
+ * Vírgula trailing opcional (ex.: { a: 1, } é válido no JS moderno).
+ */
 void ObjectLiteral() :
 {}
 {
@@ -862,6 +1118,13 @@ void ObjectLiteral() :
     <RBRACE>
 }
 
+/**
+ * Propriedade de objeto em quatro formas (resolvidas por LOOKAHEAD):
+ *  1. ...spread   — spread de outro objeto
+ *  2. nome(params) { body }   — método shorthand
+ *  3. chave: valor            — par chave-valor explícito
+ *  4. nome                    — shorthand de propriedade ({x} === {x: x})
+ */
 void ObjectProperty() :
 { Token t; }
 {
@@ -882,6 +1145,7 @@ void ObjectProperty() :
     <COLON>
     AssignmentExpression()
   |
+    // Shorthand: {x} é equivalente a {x: x} — verifica se 'x' está declarado
     t = <IDENTIFIER>
     { checkVarUse(t.image); }
 }
